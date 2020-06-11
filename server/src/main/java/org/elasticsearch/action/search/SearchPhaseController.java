@@ -69,6 +69,11 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 import java.util.function.IntFunction;
 import java.util.stream.Collectors;
@@ -445,7 +450,7 @@ public final class SearchPhaseController {
         numReducePhases++; // increment for this phase
         if (queryResults.isEmpty()) { // early terminate we have nothing to reduce
             final TotalHits totalHits = topDocsStats.getTotalHits();
-            return new ReducedQueryPhase(totalHits, topDocsStats.fetchHits, topDocsStats.getMaxScore(),
+            return new ReducedQueryPhase(totalHits, topDocsStats.fetchHits.get(), topDocsStats.getMaxScore(),
                 false, null, null, null, null, SortedTopDocs.EMPTY, null, numReducePhases, 0, 0, true);
         }
         int total = queryResults.size();
@@ -521,8 +526,8 @@ public final class SearchPhaseController {
         final SortedTopDocs sortedTopDocs = sortDocs(isScrollRequest, queryResults, bufferedTopDocs, topDocsStats, from, size,
             reducedCompletionSuggestions);
         final TotalHits totalHits = topDocsStats.getTotalHits();
-        return new ReducedQueryPhase(totalHits, topDocsStats.fetchHits, topDocsStats.getMaxScore(),
-            topDocsStats.timedOut, topDocsStats.terminatedEarly, reducedSuggest, aggregations, shardResults, sortedTopDocs,
+        return new ReducedQueryPhase(totalHits, topDocsStats.fetchHits.get(), topDocsStats.getMaxScore(),
+            topDocsStats.timedOut.get(), topDocsStats.terminatedEarly.get(), reducedSuggest, aggregations, shardResults, sortedTopDocs,
             firstResult.sortValueFormats(), numReducePhases, size, from, false);
     }
 
@@ -639,8 +644,9 @@ public final class SearchPhaseController {
         private final int topNSize;
         private final InternalAggregation.ReduceContextBuilder aggReduceContextBuilder;
         private final boolean performFinalReduce;
-        private long aggsCurrentBufferSize;
-        private long aggsMaxBufferSize;
+        private AtomicLong aggsMaxBufferSize = new AtomicLong();
+        private final BlockingQueue<DelayableWriteable.Serialized<InternalAggregations>> intermediateReducedAggsQueue;
+        private final BlockingQueue<TopDocs> intermediateReducedTopDocsQueue;
 
         /**
          * Creates a new {@link QueryPhaseResultConsumer}
@@ -683,14 +689,65 @@ public final class SearchPhaseController {
             this.topNSize = topNSize;
             this.aggReduceContextBuilder = aggReduceContextBuilder;
             this.performFinalReduce = performFinalReduce;
+            this.intermediateReducedAggsQueue = new ArrayBlockingQueue<>(expectedResultSize);
+            this.intermediateReducedTopDocsQueue = new ArrayBlockingQueue<>(expectedResultSize);
         }
 
         @Override
         public void consumeResult(SearchPhaseResult result) {
             super.consumeResult(result);
             QuerySearchResult queryResult = result.queryResult();
-            consumeInternal(queryResult);
+            putInConsumes(queryResult);
             progressListener.notifyQueryResult(queryResult.getShardIndex());
+        }
+
+        private void putInConsumes(QuerySearchResult querySearchResult) {
+            if (hasAggs) {
+                DelayableWriteable.Serialized<InternalAggregations> partialResultAggs =  querySearchResult.consumeAggs().asSerialized(InternalAggregations::new, namedWriteableRegistry);
+                aggsMaxBufferSize.addAndGet(partialResultAggs.ramBytesUsed());
+                // put in aggs queue
+                putInAggsQueue(partialResultAggs);
+                // check to start parallel reduce aggs task
+                if (intermediateReducedAggsQueue.size() > 1) {
+                    // start parallel reduce aggs task
+                    submitParallelAggsTask();
+                }
+            }
+            if (hasTopDocs) {
+                final TopDocsAndMaxScore topDocs = querySearchResult.consumeTopDocs(); // can't be null
+                topDocsStats.add(topDocs, querySearchResult.searchTimedOut(), querySearchResult.terminatedEarly());
+                setShardIndex(topDocs.topDocs, querySearchResult.getShardIndex());
+                TopDocs partialResultTopDocs = topDocs.topDocs;
+                putinTopDocsQueue(partialResultTopDocs);
+                if (intermediateReducedTopDocsQueue.size() > 1) {
+                    // start parallel reduce top docs task
+                    submitParallelTopDocsTask();
+                }
+            }
+        }
+
+        private void putInAggsQueue(DelayableWriteable.Serialized<InternalAggregations> aggs) {
+            while (true) {
+                try {
+                    intermediateReducedAggsQueue.put(aggs);
+                    break;
+                } catch (InterruptedException e) {
+                }
+            }
+        }
+
+        private void putinTopDocsQueue(TopDocs topDocs) {
+            while (true) {
+                try {
+                    intermediateReducedTopDocsQueue.put(topDocs);
+                    break;
+                } catch (InterruptedException e) {
+                }
+            }
+        }
+
+        private void submitParallelAggsTask() {
+            
         }
 
         private synchronized void consumeInternal(QuerySearchResult querySearchResult) {
@@ -769,6 +826,66 @@ public final class SearchPhaseController {
         }
 
         int getNumReducePhases() { return numReducePhases; }
+
+
+        class PartialReduceAggsTask implements Runnable {
+
+            public PartialReduceAggsTask(BlockingQueue<DelayableWriteable.Serialized<InternalAggregations>> queue,
+                                         AtomicLong aggsMaxBufferSize) {
+                this.queue = queue;
+                this.aggsMaxBufferSize = aggsMaxBufferSize;
+            }
+
+            private final BlockingQueue<DelayableWriteable.Serialized<InternalAggregations>> queue;
+            private final AtomicLong aggsMaxBufferSize;
+
+            @Override
+            public void run() {
+                int fetches = 0;
+                List<DelayableWriteable.Serialized<InternalAggregations>> results = new ArrayList<>();
+                synchronized (queue) {
+                    /*
+                     * other tasks may fetch from queue to change the queue size when current task check queue size to
+                     * fetch results, this may cause to some tasks misread the queue size before starting to reduce,
+                     * so we synced this block for checking queue size to fetches
+                     */
+                    if (queue.size() < 2) {
+                        return; //  no sufficient results to reduce
+                    }
+                    if (queue.size() == 2) {
+                        fetches = 2;
+                    } else {
+                        fetches = 3;
+                    }
+                    for (int i = 0; i < fetches; i++) {
+                        results.add(queue.remove());
+                    }
+                }
+                List<InternalAggregations> aggs = new ArrayList<>(fetches);
+                long previousBufferSize = 0;
+                for (DelayableWriteable.Serialized<InternalAggregations> result : results) {
+                    aggs.add(result.expand());
+                    previousBufferSize += result.ramBytesUsed();
+                }
+                results.clear();
+                InternalAggregations reduced =
+                    InternalAggregations.topLevelReduce(aggs, aggReduceContextBuilder.forPartialReduction());
+                DelayableWriteable.Serialized<InternalAggregations> reducedAggs =
+                    DelayableWriteable.referencing(reduced)
+                    .asSerialized(InternalAggregations::new, namedWriteableRegistry);
+                logger.trace("aggs parallel partial reduction [{}->{}] max [{}]",
+                    previousBufferSize, reducedAggs.ramBytesUsed(), aggsMaxBufferSize.get());
+                // re-enqueue
+                putInAggsQueue(reducedAggs);
+                if (queue.size() > 1) {
+                    submitParallelAggsTask();
+                }
+                // check whether all partial reduce is done
+                if (checkParitalReduceAggsDone()) {
+                    releaseAggsWait();
+                }
+            }
+        }
     }
 
     /**
@@ -813,17 +930,17 @@ public final class SearchPhaseController {
 
     static final class TopDocsStats {
         final int trackTotalHitsUpTo;
-        long totalHits;
-        private TotalHits.Relation totalHitsRelation;
-        long fetchHits;
+        AtomicLong totalHits;
+        private final AtomicReference<TotalHits.Relation> totalHitsRelation = new AtomicReference<>();
+        AtomicLong fetchHits = new AtomicLong();
         private float maxScore = Float.NEGATIVE_INFINITY;
-        boolean timedOut;
-        Boolean terminatedEarly;
+        AtomicBoolean timedOut = new AtomicBoolean();
+        AtomicBoolean terminatedEarly;
 
         TopDocsStats(int trackTotalHitsUpTo) {
             this.trackTotalHitsUpTo = trackTotalHitsUpTo;
-            this.totalHits = 0;
-            this.totalHitsRelation = Relation.EQUAL_TO;
+            this.totalHits = new AtomicLong();
+            this.totalHitsRelation.set(Relation.EQUAL_TO);
         }
 
         float getMaxScore() {
@@ -834,11 +951,11 @@ public final class SearchPhaseController {
             if (trackTotalHitsUpTo == SearchContext.TRACK_TOTAL_HITS_DISABLED) {
                 return null;
             } else if (trackTotalHitsUpTo == SearchContext.TRACK_TOTAL_HITS_ACCURATE) {
-                assert totalHitsRelation == Relation.EQUAL_TO;
-                return new TotalHits(totalHits, totalHitsRelation);
+                assert totalHitsRelation.get() == Relation.EQUAL_TO;
+                return new TotalHits(totalHits.get(), totalHitsRelation.get());
             } else {
-                if (totalHits <= trackTotalHitsUpTo) {
-                    return new TotalHits(totalHits, totalHitsRelation);
+                if (totalHits.get() <= trackTotalHitsUpTo) {
+                    return new TotalHits(totalHits.get(), totalHitsRelation.get());
                 } else {
                     /*
                      * The user requested to count the total hits up to <code>trackTotalHitsUpTo</code>
@@ -853,23 +970,25 @@ public final class SearchPhaseController {
 
         void add(TopDocsAndMaxScore topDocs, boolean timedOut, Boolean terminatedEarly) {
             if (trackTotalHitsUpTo != SearchContext.TRACK_TOTAL_HITS_DISABLED) {
-                totalHits += topDocs.topDocs.totalHits.value;
+                totalHits.addAndGet(topDocs.topDocs.totalHits.value);
                 if (topDocs.topDocs.totalHits.relation == Relation.GREATER_THAN_OR_EQUAL_TO) {
-                    totalHitsRelation = TotalHits.Relation.GREATER_THAN_OR_EQUAL_TO;
+                    totalHitsRelation.set(TotalHits.Relation.GREATER_THAN_OR_EQUAL_TO);
                 }
             }
-            fetchHits += topDocs.topDocs.scoreDocs.length;
+            fetchHits.addAndGet(topDocs.topDocs.scoreDocs.length);
             if (!Float.isNaN(topDocs.maxScore)) {
-                maxScore = Math.max(maxScore, topDocs.maxScore);
+                synchronized (this) {
+                    maxScore = Math.max(maxScore, topDocs.maxScore);
+                }
             }
             if (timedOut) {
-                this.timedOut = true;
+                this.timedOut.set(true);
             }
             if (terminatedEarly != null) {
                 if (this.terminatedEarly == null) {
-                    this.terminatedEarly = terminatedEarly;
+                    this.terminatedEarly.set(terminatedEarly);
                 } else if (terminatedEarly) {
-                    this.terminatedEarly = true;
+                    this.terminatedEarly.set(true);
                 }
             }
         }

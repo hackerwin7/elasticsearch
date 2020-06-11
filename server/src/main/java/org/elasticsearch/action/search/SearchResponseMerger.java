@@ -201,7 +201,7 @@ final class SearchResponseMerger {
         //make failures ordering consistent between ordinary search and CCS by looking at the shard they come from
         Arrays.sort(shardFailures, FAILURES_COMPARATOR);
         InternalSearchResponse response = new InternalSearchResponse(mergedSearchHits, reducedAggs, suggest, profileShardResults,
-            topDocsStats.timedOut, topDocsStats.terminatedEarly, numReducePhases);
+            topDocsStats.timedOut.get(), topDocsStats.terminatedEarly, numReducePhases);
         long tookInMillis = searchTimeProvider.buildTookInMillis();
         return new SearchResponse(response, null, totalShards, successfulShards, skippedShards, tookInMillis, shardFailures, clusters);
     }
