@@ -171,8 +171,7 @@ public class SearchReduceBenchmarkParallel {
                 return InternalAggregation.ReduceContext.forFinalReduction(
                     BigArrays.NON_RECYCLING_INSTANCE, null, b -> {}, PipelineAggregator.PipelineTree.EMPTY);
             }
-        }, true, threadPool);
-        consumer.setParallelBuffSize(termsList.getBuffSize());
+        }, true, threadPool, termsList.getBuffSize());
         for (int i = 0; i < shards.size(); i++) {
             consumer.consumeResult(shards.get(i));
         }
